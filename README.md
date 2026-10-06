@@ -1,6 +1,27 @@
-# NEXUS API UANL
+# NEXUS API UANL + Telegram Bot & Instance Manager
 
-![Python](https://img.shields.io/badge/Python-3.13-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109.2-green) ![License](https://img.shields.io/badge/License-MIT-orange)
+![Python](https://img.shields.io/badge/Python-3.12%2B-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109.2-green) ![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4) ![License](https://img.shields.io/badge/License-MIT-orange)
+
+> ## 🙌 Créditos Especiales / Original Author
+> Este proyecto está construido sobre el increíble trabajo original de **[Raúl González (`@Raulgooo`)](https://github.com/Raulgooo)** y su repositorio **[`Raulgooo/NexusAPI`](https://github.com/Raulgooo/NexusAPI)**, quien realizó toda la ingeniería inversa del ciclo de autenticación entre **SIASE** y la API privada de **Plataforma Nexus UANL**.
+>
+> ***«Le debes una coca a Rau 🥤»*** — Si este proyecto te salvó el semestre, ve a darle una estrella ⭐ al repo original: **[github.com/Raulgooo/NexusAPI](https://github.com/Raulgooo/NexusAPI)**
+
+---
+
+## ✨ Nuevas Funcionalidades en este Fork
+
+- **Parche `HTMLToken` para SIASE (2026)**: Extracción automática del token CSRF oculto en `login.htm` antes de autenticar en `eselcarrera.htm`.
+- **Detección Dinámica de Facultad (`AreaAcademicaId`)**: Soporta cualquier facultad o preparatoria de la UANL automáticamente desde `ConsultarPerfil`.
+- **Bot de Telegram (`telegram_bot.py`)**:
+  - Inicio de sesión manual por chat (`/login MATRICULA PASSWORD`) con borrado automático del mensaje de contraseña y cierre de sesión (`/reset` / `/clear`).
+  - Lista de tareas ordenada de **la más próxima a vencer a la más lejana**.
+  - **Advertencias de hora temprana**: Alerta especial si una tarea **no vence a las 11:59 PM** (y alerta crítica `🚨` si vence **antes de las 11:00 PM**).
+  - **Notificador Automático en Segundo Plano**: Avisos a las `48h`, `24h`, `6h` y `2h` antes de cada entrega.
+  - **Detector de Cambios de Fecha**: Alerta con alarma (`🚨⏰`) si un profesor **adelanta** una fecha de entrega, o aviso (`🎉📅`) si la **aplaza**.
+- **WinForms Protected Instance Manager (`NexusInstanceManager.cs`)**: Monitor visual en escritorio con estado en vivo de cada `.py`, consola de mensajes `IN` / `OUT` en tiempo real y watchdog anti-cierre.
+
+---
 
 **NEXUS API** es un API REST de código abierto que permite acceder a la información académica de NEXUS UANL de forma clara y documentada. Ideal para estudiantes, desarrolladores o cualquier persona interesada en construir aplicaciones web, dashboards o integraciones personalizadas con datos de la universidad.
 
