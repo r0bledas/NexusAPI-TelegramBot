@@ -1,6 +1,8 @@
 import os
+import sys
 import time
 import html
+import re
 import threading
 from datetime import datetime
 from typing import Dict, Any, Optional, Set, Tuple, List
@@ -23,7 +25,9 @@ SIGNATURE = "\n\n━━━━━━━━━━━━━━━\n<i>Le debes una 
 #   "password": str,
 #   "alerts": bool,
 #   "sent_alerts": Set[str],
-#   "known_due_dates": Dict[str, datetime]
+#   "known_due_dates": Dict[str, datetime],
+#   "known_grades": Dict[str, float],
+#   "last_digest_date": str
 # }
 chat_sessions: Dict[int, Dict[str, Any]] = {}
 # user -> {"token": str, "perfil": list, "cursos": list, "tareas": list, "timestamp": float}
@@ -42,8 +46,13 @@ def parse_due_date(date_str: Optional[str]) -> Optional[datetime]:
     return None
 
 
-def make_task_key(curso: str, desc: str) -> str:
-    return f"{curso.strip()}|{desc.strip()}"
+def make_task_key(t: Dict[str, Any]) -> str:
+    curso = str(t.get("Curso") or "General").strip()
+    el_id = t.get("ElementoId")
+    desc = str(t.get("Descripcion") or "Sin descripción").strip()
+    if el_id is not None:
+        return f"{curso}|#{el_id}"
+    return f"{curso}|{desc}"
 
 
 def format_time_diff(seconds: float) -> str:
@@ -74,61 +83,82 @@ def get_unusual_time_warning(dt: Optional[datetime]) -> Optional[str]:
     return None
 
 
-def detect_due_date_changes(
+def detect_task_and_grade_changes(
     chat_id: int, tareas: List[Dict[str, Any]]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Compares current `tareas` against `session['known_due_dates']`.
-    Returns (moved_closer_list, postponed_list) and updates `known_due_dates`.
+    Compares current `tareas` against `session['known_due_dates']` and `session['known_grades']`.
+    Returns (moved_closer, postponed, newly_added, newly_graded) and updates session snapshots.
     """
     moved_closer: List[Dict[str, Any]] = []
     postponed: List[Dict[str, Any]] = []
+    newly_added: List[Dict[str, Any]] = []
+    newly_graded: List[Dict[str, Any]] = []
 
     with state_lock:
         session = chat_sessions.get(chat_id)
         if not session:
-            return moved_closer, postponed
-        known: Optional[Dict[str, datetime]] = session.get("known_due_dates")
-        is_first_snapshot = known is None
+            return moved_closer, postponed, newly_added, newly_graded
+
+        known_dates: Optional[Dict[str, datetime]] = session.get("known_due_dates")
+        known_grades: Optional[Dict[str, float]] = session.get("known_grades")
+        is_first_snapshot = known_dates is None
         if is_first_snapshot:
-            known = {}
-            session["known_due_dates"] = known
+            known_dates = {}
+            known_grades = {}
+            session["known_due_dates"] = known_dates
+            session["known_grades"] = known_grades
 
         for t in tareas:
             curso = str(t.get("Curso") or "General")
             desc = str(t.get("Descripcion") or "Sin descripción").strip()
             new_dt = parse_due_date(t.get("FechaEntrega"))
-            if not new_dt:
-                continue
-            key = make_task_key(curso, desc)
-            old_dt = known.get(key)
+            key = make_task_key(t)
 
-            if not is_first_snapshot and old_dt and old_dt != new_dt:
-                diff_sec = (new_dt - old_dt).total_seconds()
-                change_info = {
-                    "curso": curso,
-                    "desc": desc,
-                    "old_dt": old_dt,
-                    "new_dt": new_dt,
-                    "diff_str": format_time_diff(diff_sec),
-                }
-                if diff_sec < 0:
-                    moved_closer.append(change_info)
-                else:
-                    postponed.append(change_info)
+            # 1. Check new task or due date change
+            if new_dt:
+                if not is_first_snapshot and key not in known_dates:
+                    newly_added.append(t)
+                elif not is_first_snapshot and key in known_dates:
+                    old_dt = known_dates[key]
+                    if old_dt != new_dt:
+                        diff_sec = (new_dt - old_dt).total_seconds()
+                        change_info = {
+                            "curso": curso,
+                            "desc": desc,
+                            "old_dt": old_dt,
+                            "new_dt": new_dt,
+                            "diff_str": format_time_diff(diff_sec),
+                        }
+                        if diff_sec < 0:
+                            moved_closer.append(change_info)
+                        else:
+                            postponed.append(change_info)
+                known_dates[key] = new_dt
 
-            known[key] = new_dt
+            # 2. Check new or updated grade
+            cal = t.get("Calificacion")
+            if cal is not None:
+                cal_val = float(cal)
+                old_cal = known_grades.get(key) if known_grades is not None else None
+                if not is_first_snapshot and (old_cal is None or abs(old_cal - cal_val) > 0.001):
+                    newly_graded.append(t)
+                if known_grades is not None:
+                    known_grades[key] = cal_val
 
-    return moved_closer, postponed
+    return moved_closer, postponed, newly_added, newly_graded
 
 
-def send_due_date_change_notifications(
+def send_change_notifications(
     client: httpx.Client,
     chat_id: int,
     moved_closer: List[Dict[str, Any]],
     postponed: List[Dict[str, Any]],
+    newly_added: List[Dict[str, Any]],
+    newly_graded: List[Dict[str, Any]],
 ):
     now = datetime.now()
+
     # 1. Alarm message if any due date was pulled closer
     if moved_closer:
         lines = [
@@ -169,6 +199,47 @@ def send_due_date_change_notifications(
             )
         send_message(client, chat_id, "\n\n".join(lines), reply_markup=build_main_keyboard(chat_id))
 
+    # 3. New assignment uploaded alert
+    if newly_added:
+        lines = [
+            "🆕📋 <b>¡NUEVA TAREA PUBLICADA EN NEXUS!</b>\n"
+            "<i>Se acaba de subir una nueva actividad o examen:</i>\n"
+        ]
+        for t in newly_added:
+            dt = parse_due_date(t.get("FechaEntrega"))
+            dt_str = dt.strftime("%d/%b/%Y %H:%M") if dt else "Sin fecha"
+            valor = t.get("Valor")
+            val_str = f" | 💎 Valor: <b>{valor:g} pts</b>" if valor is not None else ""
+            equipo_str = "👥 En equipo" if t.get("EnEquipo") else "👤 Individual"
+            time_warn = get_unusual_time_warning(dt)
+            warn_line = f"\n  {time_warn}" if time_warn else ""
+            lines.append(
+                f"🆕 <b>{html.escape(str(t.get('Descripcion', '')))}</b>\n"
+                f"  📘 <i>{html.escape(str(t.get('Curso', '')))}</i> ({equipo_str}{val_str})\n"
+                f"  📅 Vence: <b>{dt_str}</b>{warn_line}"
+            )
+        send_message(client, chat_id, "\n\n".join(lines), reply_markup=build_main_keyboard(chat_id))
+
+    # 4. Newly graded assignment alert
+    if newly_graded:
+        lines = [
+            "🏆📊 <b>¡TAREA CALIFICADA EN NEXUS!</b>\n"
+            "<i>Un profesor acaba de evaluar tu entrega:</i>\n"
+        ]
+        for t in newly_graded:
+            cal = t.get("Calificacion")
+            val = t.get("Valor")
+            pts = t.get("PuntosObtenidos")
+            pts_str = f" (<b>{pts:g} / {val:g} pts</b> del curso)" if (pts is not None and val is not None) else ""
+            retro = t.get("Retroalimentacion")
+            retro_line = f"\n  💬 <b>Retroalimentación:</b> <i>«{html.escape(str(retro).strip())}»</i>" if retro else ""
+            lines.append(
+                f"🎯 <b>{html.escape(str(t.get('Descripcion', '')))}</b>\n"
+                f"  📘 <i>{html.escape(str(t.get('Curso', '')))}</i>\n"
+                f"  🏆 <b>Calificación: {cal:g} / 100</b>{pts_str}{retro_line}"
+            )
+        send_message(client, chat_id, "\n\n".join(lines), reply_markup=build_main_keyboard(chat_id))
+
 
 def fetch_nexus_data(
     user: str,
@@ -180,7 +251,7 @@ def fetch_nexus_data(
     now = time.time()
     with state_lock:
         cached = user_cache.get(user)
-        if cached and not force_refresh and (now - cached.get("timestamp", 0) < 600):
+        if cached and not force_refresh and (now - cached.get("timestamp", 0) < 300):
             return cached
 
     token = get_token(user, password)
@@ -198,20 +269,43 @@ def fetch_nexus_data(
     with state_lock:
         user_cache[user] = data
 
-    # Check due date changes for all chats logged into this user account
     with state_lock:
         matching_chats = [
             cid for cid, s in chat_sessions.items() if s.get("user") == user
         ]
     for cid in matching_chats:
-        closer, later = detect_due_date_changes(cid, tareas)
-        if client and (closer or later):
-            send_due_date_change_notifications(client, cid, closer, later)
+        closer, later, added, graded = detect_task_and_grade_changes(cid, tareas)
+        if client and (closer or later or added or graded):
+            send_change_notifications(client, cid, closer, later, added, graded)
 
     return data
 
 
-def format_due_badge(dt: Optional[datetime], now: datetime) -> str:
+def format_task_status_line(t: Dict[str, Any]) -> str:
+    entregada = bool(t.get("Entregada"))
+    archivo = t.get("ArchivoEntregado")
+    cal = t.get("Calificacion")
+    val = t.get("Valor")
+    pts = t.get("PuntosObtenidos")
+    equipo = "👥 Equipo" if t.get("EnEquipo") else "👤 Indiv."
+    val_str = f" • 💎 {val:g} pts" if val is not None else ""
+
+    parts = []
+    if entregada:
+        file_note = f" (<code>{html.escape(str(archivo))}</code>)" if archivo else ""
+        parts.append(f"✅ <b>ENTREGADA</b>{file_note}")
+    else:
+        parts.append("❌ <b>SIN ENTREGAR</b>")
+
+    if cal is not None:
+        pts_note = f" ({pts:g}/{val:g} pts)" if (pts is not None and val is not None) else ""
+        parts.append(f"🏆 <b>Calif: {cal:g}/100</b>{pts_note}")
+
+    parts.append(f"{equipo}{val_str}")
+    return " | ".join(parts)
+
+
+def format_due_badge(dt: Optional[datetime], now: datetime, entregada: bool = False) -> str:
     if not dt:
         return "📅 Sin fecha"
     delta = dt - now
@@ -220,7 +314,7 @@ def format_due_badge(dt: Optional[datetime], now: datetime) -> str:
     date_pretty = dt.strftime("%d/%b/%Y %H:%M")
 
     if total_sec < 0:
-        badge = f"✅ Venció ({date_pretty})"
+        badge = f"🕒 Cerró ({date_pretty})"
     elif days == 0:
         hours_left = max(0, int(total_sec // 3600))
         mins_left = max(0, int((total_sec % 3600) // 60))
@@ -234,8 +328,8 @@ def format_due_badge(dt: Optional[datetime], now: datetime) -> str:
     else:
         badge = f"📅 En <b>{days} días</b> ({date_pretty})"
 
-    # Append unusual time warning for upcoming tasks
-    if total_sec >= 0:
+    # Append unusual time warning for upcoming unsubmitted tasks
+    if total_sec >= 0 and not entregada:
         time_warn = get_unusual_time_warning(dt)
         if time_warn:
             badge += f"\n  {time_warn}"
@@ -248,20 +342,23 @@ def build_main_keyboard(chat_id: int):
     return {
         "inline_keyboard": [
             [
-                {"text": "📋 Próximas Tareas", "callback_data": "pendientes"},
+                {"text": "📋 Tareas a Vencer", "callback_data": "pendientes"},
                 {"text": "🚨 Esta Semana", "callback_data": "semana"},
             ],
             [
+                {"text": "📊 Calificaciones / Entregas", "callback_data": "calificaciones"},
                 {"text": "📚 Mis Cursos", "callback_data": "cursos"},
+            ],
+            [
                 {"text": "👤 Mi Perfil", "callback_data": "perfil"},
-            ],
-            [
                 {"text": "📅 Todas las Tareas", "callback_data": "todas"},
-                {"text": "🔄 Actualizar SIASE", "callback_data": "refresh"},
             ],
             [
+                {"text": "🔄 Actualizar SIASE", "callback_data": "refresh"},
                 {"text": alert_label, "callback_data": "toggle_alerts"},
-                {"text": "🗑️ Reset / Salir", "callback_data": "reset"},
+            ],
+            [
+                {"text": "🗑️ Reset / Cerrar Sesión", "callback_data": "reset"},
             ],
         ]
     }
@@ -299,6 +396,60 @@ def format_cursos(data: Dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
+def format_calificaciones(data: Dict[str, Any]) -> str:
+    tareas = data.get("tareas", [])
+    if not tareas:
+        return "📊 No se encontraron actividades en el portafolio."
+
+    by_course: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tareas:
+        c = str(t.get("Curso") or "General")
+        by_course.setdefault(c, []).append(t)
+
+    lines = ["📊 <b>Portafolio de Calificaciones y Entregas</b>\n"]
+    for curso, items in by_course.items():
+        pts_ganados = sum(float(x["PuntosObtenidos"]) for x in items if x.get("PuntosObtenidos") is not None)
+        pts_evaluados = sum(float(x["Valor"]) for x in items if x.get("Calificacion") is not None and x.get("Valor") is not None)
+        pts_totales = sum(float(x["Valor"]) for x in items if x.get("Valor") is not None)
+        entregadas_cnt = sum(1 for x in items if x.get("Entregada"))
+
+        lines.append(
+            f"📘 <b>{html.escape(curso)}</b>\n"
+            f"   • Entregas: <b>{entregadas_cnt}/{len(items)}</b> | "
+            f"Puntos ganados: <b>{pts_ganados:g} / {pts_evaluados:g} pts evaluados</b> (Total curso: {pts_totales:g} pts)"
+        )
+        for x in items:
+            desc = html.escape(str(x.get("Descripcion") or "").strip())
+            cal = x.get("Calificacion")
+            val = x.get("Valor")
+            pts = x.get("PuntosObtenidos")
+            ent = x.get("Entregada")
+            retro = x.get("Retroalimentacion")
+
+            if cal is not None:
+                pts_txt = f" ({pts:g}/{val:g} pts)" if (pts is not None and val is not None) else ""
+                status = f"🏆 <b>{cal:g}/100</b>{pts_txt}"
+            elif ent:
+                status = "✅ Entregada (Pendiente de calificar)"
+            else:
+                dt = parse_due_date(x.get("FechaEntrega"))
+                if dt and dt < datetime.now():
+                    status = "❌ No entregada (Cerrada)"
+                else:
+                    status = "⏳ Pendiente de entregar"
+
+            retro_snip = ""
+            if retro:
+                clean_r = " ".join(str(retro).split())
+                if len(clean_r) > 120:
+                    clean_r = clean_r[:117] + "..."
+                retro_snip = f"\n      💬 <i>«{html.escape(clean_r)}»</i>"
+
+            lines.append(f"   └ • {desc}: {status}{retro_snip}")
+
+    return "\n\n".join(lines)
+
+
 def format_tareas(data: Dict[str, Any], mode: str = "pendientes", course_filter: Optional[str] = None) -> str:
     tareas = data.get("tareas", [])
     now = datetime.now()
@@ -312,10 +463,9 @@ def format_tareas(data: Dict[str, Any], mode: str = "pendientes", course_filter:
         if course_filter and course_filter.lower() not in curso.lower() and course_filter.lower() not in desc.lower():
             continue
         if dt and dt >= now:
-            # Sort key: seconds until due date (closest first!)
-            upcoming_items.append(((dt - now).total_seconds(), dt, curso, desc))
+            upcoming_items.append(((dt - now).total_seconds(), dt, t))
         else:
-            past_items.append((dt or datetime.min, dt, curso, desc))
+            past_items.append((dt or datetime.min, dt, t))
 
     # Strictly sort upcoming tasks by closest due date/time first
     upcoming_items.sort(key=lambda x: x[0])
@@ -323,19 +473,23 @@ def format_tareas(data: Dict[str, Any], mode: str = "pendientes", course_filter:
     past_items.sort(key=lambda x: x[0], reverse=True)
 
     if mode == "pendientes":
-        filtered = [(dt, curso, desc) for _, dt, curso, desc in upcoming_items]
-        title = f"📋 <b>Tareas a Vencer — De Más Próxima a Más Lejana ({len(filtered)})</b>"
+        filtered = [(dt, t) for _, dt, t in upcoming_items]
+        unsubmitted_cnt = sum(1 for _, t in filtered if not t.get("Entregada"))
+        title = (
+            f"📋 <b>Tareas a Vencer — De Más Próxima a Más Lejana ({len(filtered)})</b>\n"
+            f"<i>❌ Sin entregar: <b>{unsubmitted_cnt}</b> | ✅ Ya entregadas: <b>{len(filtered) - unsubmitted_cnt}</b></i>"
+        )
     elif mode == "semana":
         filtered = [
-            (dt, curso, desc)
-            for _, dt, curso, desc in upcoming_items
+            (dt, t)
+            for _, dt, t in upcoming_items
             if dt and 0 <= (dt.date() - now.date()).days <= 7
         ]
         title = f"🚨 <b>Entregas en los Próximos 7 Días — Más Próximas Primero ({len(filtered)})</b>"
     else:
         filtered = (
-            [(dt, curso, desc) for _, dt, curso, desc in upcoming_items]
-            + [(dt, curso, desc) for _, dt, curso, desc in past_items]
+            [(dt, t) for _, dt, t in upcoming_items]
+            + [(dt, t) for _, dt, t in past_items]
         )
         title = f"📅 <b>Todas las Tareas (Próximas primero, vencidas al final — {len(filtered)})</b>"
 
@@ -343,19 +497,24 @@ def format_tareas(data: Dict[str, Any], mode: str = "pendientes", course_filter:
         title += f"\n🔎 Filtro: <i>{html.escape(course_filter)}</i>"
 
     if not filtered:
-        return f"{title}\n\n🎉 ¡No hay tareas pendientes en esta categoría!"
+        return f"{title}\n\n🎉 ¡No hay tareas en esta categoría!"
 
     lines = [title + "\n"]
-    for idx, (dt, curso, desc) in enumerate(filtered[:25], 1):
-        badge = format_due_badge(dt, now)
+    for idx, (dt, t) in enumerate(filtered[:22], 1):
+        curso = str(t.get("Curso") or "General")
+        desc = str(t.get("Descripcion") or "Sin descripción").strip()
+        entregada = bool(t.get("Entregada"))
+        badge = format_due_badge(dt, now, entregada=entregada)
+        status_line = format_task_status_line(t)
         lines.append(
             f"<b>{idx}. {html.escape(desc)}</b>\n"
             f"  📘 <i>{html.escape(curso)}</i>\n"
+            f"  {status_line}\n"
             f"  {badge}"
         )
 
-    if len(filtered) > 25:
-        lines.append(f"\n<i>...y {len(filtered) - 25} tareas más.</i>")
+    if len(filtered) > 22:
+        lines.append(f"\n<i>...y {len(filtered) - 22} tareas más.</i>")
 
     return "\n\n".join(lines)
 
@@ -368,10 +527,13 @@ def handle_natural_text(text: str, data: Dict[str, Any]) -> str:
             f"👋 ¡Hola, <b>{html.escape(nombre)}</b>!\n\n"
             "Soy tu asistente de <b>Nexus / SIASE UANL</b>. Puedes usar los botones o escribirme:\n"
             "• <i>«¿Qué tengo para esta semana?»</i>\n"
+            "• <i>«Calificaciones»</i> o <i>«Portafolio»</i>\n"
             "• <i>«Tareas de Cálculo»</i> / <i>«Mecánica»</i> / <i>«Liderazgo»</i>\n"
             "• <i>«Mis cursos»</i> o <i>«Profesores»</i>\n"
             "• <code>/reset</code> o <code>/clear</code> para borrar tu sesión"
         )
+    if any(w in q for w in ["calificacion", "calificación", "portafolio", "puntos", "nota", "notas", "evaluad"]):
+        return format_calificaciones(data)
     if any(w in q for w in ["semana", "hoy", "mañana", "urgente", "pronto"]):
         return format_tareas(data, mode="semana")
     if any(w in q for w in ["curso", "materia", "profe", "maestro", "grupo"]):
@@ -399,7 +561,6 @@ def log_io(tag: str, chat_id: Any, detail: str):
 
 
 def strip_html(text: str) -> str:
-    import re
     return re.sub(r"<[^>]+>", "", text)
 
 
@@ -443,6 +604,7 @@ def register_commands(client: httpx.Client):
         {"command": "login", "description": "Iniciar sesión: /login MATRICULA PASSWORD"},
         {"command": "pendientes", "description": "Tareas a vencer (de más próxima a más lejana)"},
         {"command": "semana", "description": "Tareas que vencen hoy o esta semana"},
+        {"command": "calificaciones", "description": "Mis calificaciones, puntos y entregas"},
         {"command": "cursos", "description": "Mis cursos, grupos y profesores"},
         {"command": "perfil", "description": "Mi información de alumno SIASE/Nexus"},
         {"command": "alertas", "description": "Activar/desactivar recordatorios automáticos"},
@@ -466,8 +628,8 @@ def clear_chat_session(chat_id: int) -> Optional[str]:
 def send_login_prompt(client: httpx.Client, chat_id: int):
     msg = (
         "🔐 <b>Bienvenido a Nexus UANL Bot</b>\n\n"
-        "Para consultar tus tareas, cursos y recibir alertas automáticas (incluyendo cambios de fecha "
-        "y avisos si una tarea vence antes de las 11:00 PM), inicia sesión con tu cuenta de SIASE:\n\n"
+        "Para consultar tus tareas, calificaciones y recibir alertas automáticas (incluyendo avisos "
+        "a las 3h, 2h y 1h antes de vencer, cambios de fecha y calificaciones nuevas), inicia sesión con SIASE:\n\n"
         "👉 <code>/login TU_MATRICULA TU_CONTRASEÑA</code>\n\n"
         "<i>🔒 Tu mensaje con la contraseña se borrará automáticamente del chat y puedes usar "
         "<code>/reset</code> o <code>/clear</code> en cualquier momento para borrar tu sesión.</i>"
@@ -485,6 +647,7 @@ def check_and_send_notifications_for_chat(
         user = session["user"]
         password = session["password"]
         sent_alerts: Set[str] = session.setdefault("sent_alerts", set())
+        last_digest = session.get("last_digest_date", "")
 
     try:
         data = fetch_nexus_data(
@@ -496,30 +659,61 @@ def check_and_send_notifications_for_chat(
     now = datetime.now()
     tareas = data.get("tareas", [])
 
-    # Sort upcoming tasks by closest first so notifications also list the most urgent first
-    upcoming_sorted = []
+    # Sort upcoming UNSUBMITTED tasks by closest first
+    upcoming_unsubmitted = []
     for t in tareas:
+        if t.get("Entregada"):
+            continue
         dt = parse_due_date(t.get("FechaEntrega"))
         if dt and dt >= now:
-            upcoming_sorted.append(((dt - now).total_seconds(), dt, t))
-    upcoming_sorted.sort(key=lambda x: x[0])
+            upcoming_unsubmitted.append(((dt - now).total_seconds(), dt, t))
+    upcoming_unsubmitted.sort(key=lambda x: x[0])
 
+    # 1. Check 8:00 AM Daily Digest (between 08:00 and 08:59 if not sent today)
+    today_str = now.strftime("%Y-%m-%d")
+    if now.hour == 8 and last_digest != today_str:
+        with state_lock:
+            session["last_digest_date"] = today_str
+        week_tasks = [
+            (sec, dt, t)
+            for sec, dt, t in upcoming_unsubmitted
+            if (dt.date() - now.date()).days <= 7
+        ]
+        if week_tasks:
+            digest_lines = [
+                f"☀️ <b>RESUMEN MATUTINO NEXUS (8:00 AM)</b>\n"
+                f"Tienes <b>{len(week_tasks)}</b> entregas pendientes (sin subir) para los próximos 7 días:\n"
+            ]
+            for idx, (sec, dt, t) in enumerate(week_tasks[:15], 1):
+                curso = str(t.get("Curso") or "General")
+                desc = str(t.get("Descripcion") or "Sin descripción").strip()
+                badge = format_due_badge(dt, now, entregada=False)
+                digest_lines.append(
+                    f"<b>{idx}. {html.escape(desc)}</b>\n"
+                    f"  📘 <i>{html.escape(curso)}</i>\n"
+                    f"  {badge}"
+                )
+            send_message(client, chat_id, "\n\n".join(digest_lines), reply_markup=build_main_keyboard(chat_id))
+
+    # 2. Check Countdown Windows: 48h, 24h, 6h, 3h, 2h, 1h before expiration
     thresholds: Tuple[Tuple[str, float, float], ...] = (
         ("48h", 48.0, 24.0),
         ("24h", 24.0, 6.0),
-        ("6h", 6.0, 2.0),
-        ("2h", 2.0, 0.0),
+        ("6h", 6.0, 3.0),
+        ("3h", 3.0, 2.0),
+        ("2h", 2.0, 1.0),
+        ("1h", 1.0, 0.0),
     )
 
     urgent_lines = []
-    for sec_left, dt, t in upcoming_sorted:
+    for sec_left, dt, t in upcoming_unsubmitted:
         hours_left = sec_left / 3600.0
         curso = str(t.get("Curso") or "General")
         desc = str(t.get("Descripcion") or "Sin descripción").strip()
-        task_id = f"{curso}|{desc}|{dt.isoformat()}"
+        task_id = f"{make_task_key(t)}|{dt.isoformat()}"
 
         for label, max_h, min_h in thresholds:
-            if min_h <= hours_left <= max_h:
+            if min_h < hours_left <= max_h:
                 alert_key = f"{task_id}:{label}"
                 with state_lock:
                     if alert_key in sent_alerts:
@@ -530,36 +724,37 @@ def check_and_send_notifications_for_chat(
                 m_int = int((hours_left - h_int) * 60)
                 time_warn = get_unusual_time_warning(dt)
                 warn_block = f"\n  {time_warn}" if time_warn else ""
+                urgent_icon = "🚨🔥" if max_h <= 3.0 else "⏰"
                 urgent_lines.append(
-                    f"• <b>{html.escape(desc)}</b>\n"
-                    f"  📘 <i>{html.escape(curso)}</i>\n"
-                    f"  ⏰ Vence en <b>{h_int}h {m_int}m</b> ({dt.strftime('%d/%b %H:%M')}){warn_block}"
+                    f"{urgent_icon} <b>[Aviso {label}] {html.escape(desc)}</b>\n"
+                    f"  📘 <i>{html.escape(curso)}</i> (❌ <b>SIN ENTREGAR</b>)\n"
+                    f"  ⏳ Tiempo restante: <b>{h_int}h {m_int}m</b> (Vence: {dt.strftime('%d/%b %H:%M')}){warn_block}"
                 )
                 break
 
     if urgent_lines:
         header = (
-            "🔔 <b>¡ALERTA AUTOMÁTICA DE TAREAS NEXUS!</b>\n"
-            "Tienes entregas próximas a vencer (ordenadas de más próxima a más lejana):\n\n"
+            "🔔 <b>¡RECORDATORIO DE ENTREGA PENDIENTE!</b>\n"
+            "<i>Estas tareas aún aparecen <b>SIN ENTREGAR</b> en Nexus:</i>\n\n"
         )
         send_message(client, chat_id, header + "\n\n".join(urgent_lines), reply_markup=build_main_keyboard(chat_id))
 
 
 def auto_notifier_loop():
-    """Background daemon thread that checks all logged-in chats every 5 minutes and syncs SIASE every 15 minutes."""
+    """Background daemon thread that checks countdowns every 2 minutes and syncs live SIASE every 10 minutes."""
     cycle = 0
     with httpx.Client(timeout=30.0) as client:
         while True:
-            time.sleep(300)
+            time.sleep(120)
             cycle += 1
-            force_sync = (cycle % 3 == 0)  # Force live SIASE sync every 15 mins to detect due date changes
+            force_sync = (cycle % 5 == 0)  # Live SIASE sync every 10 mins
             with state_lock:
                 active_chat_ids = list(chat_sessions.keys())
             for cid in active_chat_ids:
                 try:
                     check_and_send_notifications_for_chat(client, cid, force_sync=force_sync)
                 except Exception as e:
-                    print(f"Notifier error for chat {cid}: {e}")
+                    print(f"Notifier error for chat {cid}: {e}", flush=True)
 
 
 def process_action(client: httpx.Client, chat_id: int, action: str):
@@ -596,9 +791,11 @@ def process_action(client: httpx.Client, chat_id: int, action: str):
             client,
             chat_id,
             f"⚙️ Las alertas automáticas de tareas ahora están: <b>{status_str}</b>\n\n"
-            "• Recordatorios a las <b>48h, 24h, 6h y 2h</b> antes de vencer.\n"
-            "• 🚨 Alerta con alarma si una tarea se <b>adelanta</b> a una fecha más cercana.\n"
-            "• 🎉 Aviso si una tarea se <b>aplaza</b> con más tiempo.\n"
+            "• ⏰ Recordatorios a las <b>48h, 24h, 6h, 3h, 2h y 1h</b> antes de vencer (solo si aún no la has entregado).\n"
+            "• ☀️ Resumen matutino a las <b>8:00 AM</b>.\n"
+            "• 🆕 Aviso cuando suban una <b>nueva tarea</b>.\n"
+            "• 🏆 Aviso cuando te <b>califiquen</b> una tarea (+ retroalimentación).\n"
+            "• 🚨 Alerta con alarma si una fecha se <b>adelanta</b> o 🎉 si se <b>aplaza</b>.\n"
             "• ⚠️ Advertencia si no vence a las 11:59 PM (o antes de las 11:00 PM).",
             reply_markup=build_main_keyboard(chat_id),
         )
@@ -607,7 +804,7 @@ def process_action(client: httpx.Client, chat_id: int, action: str):
     try:
         force = action == "refresh"
         if force:
-            send_message(client, chat_id, "🔄 Sincronizando en vivo con SIASE y verificando cambios de fecha...")
+            send_message(client, chat_id, "🔄 Sincronizando en vivo con SIASE, Portafolio y Calificaciones...")
         data = fetch_nexus_data(user, password, force_refresh=force, chat_id=chat_id, client=client)
     except Exception as e:
         send_message(
@@ -625,28 +822,31 @@ def process_action(client: httpx.Client, chat_id: int, action: str):
             t for t in data.get("tareas", [])
             if (dt := parse_due_date(t.get("FechaEntrega"))) and dt >= now
         ]
-        week = [
-            t for t in upcoming
+        unsubmitted_upcoming = [t for t in upcoming if not t.get("Entregada")]
+        week_unsubmitted = [
+            t for t in unsubmitted_upcoming
             if (dt := parse_due_date(t.get("FechaEntrega"))) and 0 <= (dt.date() - now.date()).days <= 7
         ]
+        graded_count = sum(1 for t in data.get("tareas", []) if t.get("Calificacion") is not None)
         early_tasks = [
-            t for t in upcoming
+            t for t in unsubmitted_upcoming
             if (dt := parse_due_date(t.get("FechaEntrega"))) and (dt.hour, dt.minute) != (23, 59)
         ]
         early_warning = ""
         if early_tasks:
             early_warning = (
-                f"\n⚠️ <b>¡Atención!</b> Tienes <b>{len(early_tasks)}</b> entregas próximas que "
-                f"<b>NO vencen a las 11:59 PM</b> (revisa <i>Próximas Tareas</i>).\n"
+                f"\n⚠️ <b>¡Atención!</b> Tienes <b>{len(early_tasks)}</b> entregas sin subir que "
+                f"<b>NO vencen a las 11:59 PM</b> (revisa <i>Tareas a Vencer</i>).\n"
             )
 
         msg = (
             f"🎓 <b>Nexus UANL Bot Activo</b>\n\n"
             f"👤 <b>Alumno:</b> {html.escape(nombre)} (<code>{html.escape(user)}</code>)\n"
             f"📚 <b>Cursos activos:</b> {len(data.get('cursos', []))}\n"
-            f"📋 <b>Tareas pendientes:</b> {len(upcoming)}\n"
-            f"🚨 <b>Vencen esta semana:</b> {len(week)}\n"
-            f"🔔 <b>Alertas automáticas:</b> {'ON' if session.get('alerts', True) else 'OFF'}"
+            f"❌ <b>Por entregar (próximas):</b> {len(unsubmitted_upcoming)} (de {len(upcoming)} abiertas)\n"
+            f"🚨 <b>Sin entregar esta semana:</b> {len(week_unsubmitted)}\n"
+            f"🏆 <b>Tareas calificadas:</b> {graded_count}\n"
+            f"🔔 <b>Alertas (48h/24h/6h/3h/2h/1h):</b> {'ON' if session.get('alerts', True) else 'OFF'}"
             f"{early_warning}\n"
             f"Selecciona una opción o escríbeme cualquier duda sobre tus materias:"
         )
@@ -655,6 +855,8 @@ def process_action(client: httpx.Client, chat_id: int, action: str):
         send_message(client, chat_id, format_tareas(data, mode="pendientes"), reply_markup=build_main_keyboard(chat_id))
     elif action in ("semana", "urgentes"):
         send_message(client, chat_id, format_tareas(data, mode="semana"), reply_markup=build_main_keyboard(chat_id))
+    elif action in ("calificaciones", "portafolio", "notas"):
+        send_message(client, chat_id, format_calificaciones(data), reply_markup=build_main_keyboard(chat_id))
     elif action == "cursos":
         send_message(client, chat_id, format_cursos(data), reply_markup=build_main_keyboard(chat_id))
     elif action == "perfil":
@@ -667,7 +869,6 @@ def process_action(client: httpx.Client, chat_id: int, action: str):
 
 
 def main():
-    import sys
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -728,7 +929,7 @@ def main():
                                 )
                             else:
                                 u, p = parts[1].strip(), parts[2].strip()
-                                send_message(client, chat_id, f"🔐 Conectando matrícula <code>{html.escape(u)}</code> con SIASE...")
+                                send_message(client, chat_id, f"🔐 Conectando matrícula <code>{html.escape(u)}</code> con SIASE y Portafolio Nexus...")
                                 try:
                                     with state_lock:
                                         chat_sessions[chat_id] = {
@@ -737,6 +938,8 @@ def main():
                                             "alerts": True,
                                             "sent_alerts": set(),
                                             "known_due_dates": None,
+                                            "known_grades": None,
+                                            "last_digest_date": "",
                                         }
                                     fetch_nexus_data(u, p, force_refresh=True, chat_id=chat_id, client=client)
                                     process_action(client, chat_id, "start")

@@ -28,6 +28,29 @@ def get_area_ids(token):
         return ['44']
 
 
+import concurrent.futures
+
+
+def _fetch_portafolio_course(token, area_id, curso_id):
+    try:
+        url = "https://api.nexus.uanl.mx/WebApi/Portafolio/ConsultarPortafolio"
+        headers = {
+            'accept': 'application/json, text/plain, */*',
+            'areaacademicaid': str(area_id),
+            'content-type': 'application/json',
+            'origin': 'https://plataformanexus.uanl.mx',
+            'referer': 'https://plataformanexus.uanl.mx/',
+            'rolid': '5',
+            'sistemaid': '1',
+            'token': token,
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        }
+        r = requests.post(url, headers=headers, data=json.dumps({"CursoId": int(curso_id)}), timeout=15)
+        return int(curso_id), r.json().get("ElementosEvaluables", [])
+    except Exception:
+        return int(curso_id), []
+
+
 def get_cursos(token):
 
   url = "https://api.nexus.uanl.mx/WebApi/Curso/ConsultarCarpetaCursos"
@@ -68,6 +91,7 @@ def get_cursos(token):
   for carpeta in data_json.get("Carpetas", []):
       for curso in carpeta.get("Cursos", []):
           # Extraer información del curso
+          curso_id = curso.get("CursoId")
           nombre_curso = curso.get("Nombre")
           fecha_inicio = curso.get("FechaInicio")
           fecha_fin = curso.get("FechaFin")
@@ -84,6 +108,7 @@ def get_cursos(token):
 
           # Construir diccionario del curso
           curso_info = {
+              "CursoId": curso_id,
               "Nombre": nombre_curso,
               "FechaInicio": fecha_inicio,
               "FechaFin": fecha_fin,
@@ -125,15 +150,83 @@ def get_tareas(token):
 
     response = requests.post(url, headers=headers, data=payload)
     data_json = response.json()
+    raw_tareas = data_json.get("Tareas", [])
+
+    # Fetch Portafolio in parallel for all distinct CursoIds to get submission status, grades, and feedback
+    curso_ids = sorted({
+        int(t.get("Curso", {}).get("CursoId"))
+        for t in raw_tareas
+        if t.get("Curso", {}).get("CursoId")
+    })
+    portafolio_map = {}
+    if curso_ids:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            futures = [ex.submit(_fetch_portafolio_course, token, area_id, cid) for cid in curso_ids]
+            for fut in concurrent.futures.as_completed(futures):
+                cid, elementos = fut.result()
+                for el in elementos:
+                    el_id = el.get("ElementoId")
+                    if el_id is not None:
+                        portafolio_map[(cid, int(el_id))] = el
 
     tareas_json = []
 
-    for tarea in data_json.get("Tareas", []):
+    for tarea in raw_tareas:
+        curso_obj = tarea.get("Curso", {}) or {}
+        cid = curso_obj.get("CursoId")
+        el_id = tarea.get("ElementoId")
+        pf = portafolio_map.get((int(cid), int(el_id)), {}) if (cid and el_id) else {}
+
+        entregas = pf.get("Entregas") or []
+        cal_obj = pf.get("Calificacion")
+        cal_ex = pf.get("CalificacionExamen")
+
+        calificacion = None
+        if isinstance(cal_obj, dict) and cal_obj.get("Valor") is not None:
+            calificacion = float(cal_obj.get("Valor"))
+        elif isinstance(cal_ex, dict):
+            if cal_ex.get("Calificacion") is not None:
+                calificacion = float(cal_ex.get("Calificacion"))
+            elif cal_ex.get("Valor") is not None:
+                calificacion = float(cal_ex.get("Valor"))
+
+        entregada = bool(entregas) or (calificacion is not None) or (tarea.get("CantidadEntregados", 0) > 0)
+
+        archivo_entregado = None
+        fecha_subida = None
+        if entregas:
+            doc = entregas[0].get("Documento") or {}
+            archivo_entregado = doc.get("Nombre")
+            fecha_subida = entregas[0].get("FechaModificacion") or doc.get("FechaCreacion")
+
+        retros = pf.get("Retroalimentaciones") or []
+        retro_texto = None
+        if retros and isinstance(retros[0], dict):
+            retro_texto = retros[0].get("Descripcion")
+
+        valor = tarea.get("Valor") if tarea.get("Valor") is not None else pf.get("Valor")
+        puntos_obtenidos = None
+        if calificacion is not None and valor is not None:
+            try:
+                puntos_obtenidos = round((float(calificacion) * float(valor)) / 100.0, 2)
+            except Exception:
+                pass
+
         tarea_info = {
+            "ElementoId": el_id,
+            "TipoElementoId": tarea.get("TipoElementoId"),
             "Descripcion": tarea.get("Descripcion"),
             "FechaEntrega": tarea.get("FechaFin"),
-            "Curso": tarea.get("Curso", {}).get("Nombre")
-
+            "Curso": curso_obj.get("Nombre"),
+            "CursoId": cid,
+            "Valor": valor,
+            "EnEquipo": bool(tarea.get("EnEquipo") or pf.get("EnEquipo")),
+            "Entregada": entregada,
+            "ArchivoEntregado": archivo_entregado,
+            "FechaSubida": fecha_subida,
+            "Calificacion": calificacion,
+            "PuntosObtenidos": puntos_obtenidos,
+            "Retroalimentacion": retro_texto,
         }
 
         tareas_json.append(tarea_info)
