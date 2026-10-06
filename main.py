@@ -36,7 +36,7 @@ async def login(user: User):
 async def cursos(req: TokenRequest):
     token = token_cache.get(req.user)
     if not token:
-        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Token Invalido o no ha iniciado sesion.")
     return get_cursos(token)
     
 @app.post("/calendario")

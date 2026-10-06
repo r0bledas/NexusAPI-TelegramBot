@@ -3,6 +3,31 @@ import json
 from tokens import get_token
 
 
+def get_area_ids(token):
+    try:
+        url = "https://api.nexus.uanl.mx/WebApi/Seguridad/ConsultarPerfil"
+        headers = {
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json',
+            'origin': 'https://plataformanexus.uanl.mx',
+            'referer': 'https://plataformanexus.uanl.mx/',
+            'sistemaid': '1',
+            'token': token,
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
+        }
+        response = requests.post(url, headers=headers, data=json.dumps({}))
+        data_json = response.json()
+        area_ids = []
+        for cuenta in data_json.get("Persona", {}).get("Cuentas", []):
+            for area in cuenta.get("AreasAcademicas", []):
+                aid = area.get("AreaAcademicaId") or area.get("AreaAcademica", {}).get("AreaAcademicaId")
+                if aid and str(aid) not in area_ids:
+                    area_ids.append(str(aid))
+        return area_ids if area_ids else ['44']
+    except Exception:
+        return ['44']
+
+
 def get_cursos(token):
 
   url = "https://api.nexus.uanl.mx/WebApi/Curso/ConsultarCarpetaCursos"
@@ -12,10 +37,11 @@ def get_cursos(token):
     "Pagina": 1,
     "Paginacion": 10
   })
+  area_id = get_area_ids(token)[0]
   headers = {
     'accept': 'application/json, text/plain, */*',
     'accept-language': 'es-MX,es-419;q=0.9,es;q=0.8,en;q=0.7',
-    'areaacademicaid': '44',
+    'areaacademicaid': str(area_id),
     'content-type': 'application/json',
     'origin': 'https://plataformanexus.uanl.mx',
     'priority': 'u=1, i',
@@ -28,10 +54,9 @@ def get_cursos(token):
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-site',
     'sistemaid': '1',
-    'token': 'none',
+    'token': token,
     'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
   }
-  headers['token'] = token
 
   response = requests.request("POST", url, headers=headers, data=payload)
 
@@ -77,10 +102,11 @@ def get_tareas(token):
     payload = json.dumps({
     })
 
+    area_id = get_area_ids(token)[0]
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'es-MX,es-419;q=0.9,es;q=0.8,en;q=0.7',
-        'areaacademicaid': '44',
+        'areaacademicaid': str(area_id),
         'content-type': 'application/json',
         'origin': 'https://plataformanexus.uanl.mx',
         'priority': 'u=1, i',

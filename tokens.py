@@ -2,15 +2,9 @@ import httpx
 import re
 from urllib.parse import urlparse, parse_qs
 def get_token(user, password):
-
+    url_login_page = "https://deimos.dgi.uanl.mx/cgi-bin/wspd_cgi.sh/login.htm"
     url = "https://deimos.dgi.uanl.mx/cgi-bin/wspd_cgi.sh/eselcarrera.htm"
     url_nexus = "https://api.nexus.uanl.mx/WebApi/Seguridad/CrearSesionSIASE"
-    data = {
-        "HTMLTipCve": "01",
-        "HTMLUsuCve": user,
-        "HTMLPassword": password,
-        "HTMLPrograma": ""
-    }
 
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -18,6 +12,21 @@ def get_token(user, password):
         "Referer": "https://deimos.dgi.uanl.mx/cgi-bin/wspd_cgi.sh/login.htm",
         "User-Agent": "Mozilla/5.0"
     }
+
+    with httpx.Client(timeout=30.0) as client:
+        login_page_res = client.get(url_login_page, headers={"User-Agent": "Mozilla/5.0"})
+        token_match = re.search(r'name="HTMLToken"\s+value="([^"]+)"', login_page_res.text, re.IGNORECASE)
+        html_token = token_match.group(1) if token_match else ""
+
+        data = {
+            "HTMLTipCve": "01",
+            "HTMLUsuCve": user,
+            "HTMLPassword": password,
+            "HTMLPrograma": "",
+            "HTMLToken": html_token
+        }
+
+        res = client.post(url, data=data, headers=headers)
 
     headers_nexus = {
         "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
@@ -40,8 +49,6 @@ def get_token(user, password):
         "te": "trailers"
     }
 
-    res = httpx.post(url, data=data, headers=headers)
-
     # Aquí sí usamos el contenido de la respuesta
     html_content = res.text
 
@@ -52,7 +59,7 @@ def get_token(user, password):
     if match:
         url_login = match.group(1)
     else:
-        print("No se encontró la URL")
+        raise ValueError("Credenciales inválidas o no se encontró el enlace a Nexus en SIASE.")
     url_login = url_login.split('=')
     control = url_login[2] + "="
     usu = url_login[1].split("&Ctrl")[0]
@@ -61,7 +68,10 @@ def get_token(user, password):
     headers_nexus["usuarioclave"] = data["HTMLUsuCve"]
 
 
-    asknexus = httpx.post(url_nexus,  headers=headers_nexus, json={})
-    token = asknexus.json()['Sesion']['Token']
+    asknexus = httpx.post(url_nexus,  headers=headers_nexus, json={}, timeout=30.0)
+    resp_json = asknexus.json()
+    if not resp_json.get('Sesion') or not resp_json['Sesion'].get('Token'):
+        raise ValueError(f"Error al crear sesión en Nexus: {resp_json}")
+    token = resp_json['Sesion']['Token']
     return token
 
