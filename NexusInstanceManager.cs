@@ -22,7 +22,7 @@ namespace NexusManager
 
         // UI controls
         public Panel Card;
-        public Label DotLabel;
+        public Label BadgeLabel;
         public Label NameLabel;
         public Label InfoLabel;
     }
@@ -32,7 +32,8 @@ namespace NexusManager
         private readonly string workDir;
         private readonly List<PyService> services = new List<PyService>();
         private RichTextBox terminalBox;
-        private Label headerStatusLabel;
+        private ToolStripStatusLabel statusInstancesLabel;
+        private ToolStripStatusLabel statusWatchdogLabel;
         private System.Windows.Forms.Timer watchdogTimer;
         private Process guardianProc;
         private bool allowExit = false;
@@ -43,13 +44,13 @@ namespace NexusManager
             this.workDir = dir;
             this.singleInstanceMutex = mutex;
 
-            this.Text = "Nexus UANL — Protected Python Instance Manager (@NexusEsGayBot)";
-            this.Size = new Size(760, 540);
+            this.Text = "Nexus UANL - Python Instance Manager (@NexusEsGayBot)";
+            this.Size = new Size(760, 530);
             this.MinimumSize = new Size(640, 440);
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.BackColor = Color.FromArgb(15, 23, 42);
-            this.ForeColor = Color.FromArgb(226, 232, 240);
-            this.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+            this.BackColor = SystemColors.Control;
+            this.ForeColor = SystemColors.ControlText;
+            this.Font = new Font("Tahoma", 8.25f, FontStyle.Regular);
             this.KeyPreview = true;
 
             BuildUI();
@@ -67,45 +68,63 @@ namespace NexusManager
 
         private void BuildUI()
         {
+            // Bottom StatusStrip
+            StatusStrip statusStrip = new StatusStrip();
+            statusInstancesLabel = new ToolStripStatusLabel("Instances: Initializing...");
+            statusWatchdogLabel = new ToolStripStatusLabel("Watchdog: Active (400ms) | Exit: Ctrl+Shift+Alt+K")
+            {
+                Spring = true,
+                TextAlign = ContentAlignment.MiddleRight
+            };
+            statusStrip.Items.Add(statusInstancesLabel);
+            statusStrip.Items.Add(statusWatchdogLabel);
+
             // Top Header Panel
             Panel header = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 52,
-                BackColor = Color.FromArgb(30, 41, 59),
-                Padding = new Padding(14, 8, 14, 8)
+                Height = 44,
+                BackColor = SystemColors.Control,
+                Padding = new Padding(10, 6, 10, 4)
             };
 
             Label titleLbl = new Label
             {
-                Text = "🛡️ NEXUS UANL — PYTHON INSTANCE MONITOR",
-                Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(56, 189, 248),
+                Text = "NEXUS UANL - PYTHON INSTANCE MONITOR",
+                Font = new Font("Tahoma", 9.5f, FontStyle.Bold),
+                ForeColor = SystemColors.ControlText,
                 AutoSize = true,
-                Location = new Point(14, 8)
+                Location = new Point(8, 6)
             };
 
-            headerStatusLabel = new Label
+            Label subLbl = new Label
             {
-                Text = "WATCHDOG ACTIVE • CLOSE LOCKED • AUTO-RESPAWN ON",
-                Font = new Font("Consolas", 8.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(74, 222, 128),
+                Text = "Watchdog: Active | Protection: Locked | Auto-Respawn: Enabled",
+                Font = new Font("Tahoma", 8.25f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(70, 70, 70),
                 AutoSize = true,
-                Location = new Point(16, 30)
+                Location = new Point(9, 24)
             };
 
             header.Controls.Add(titleLbl);
-            header.Controls.Add(headerStatusLabel);
+            header.Controls.Add(subLbl);
 
-            // Services Status Panel (4 cards for the 4 .py files)
+            // Services GroupBox
+            GroupBox servicesGroup = new GroupBox
+            {
+                Text = "Managed Python Services and Modules",
+                Dock = DockStyle.Top,
+                Height = 154,
+                Padding = new Padding(8, 10, 8, 8),
+                BackColor = SystemColors.Control
+            };
+
             TableLayoutPanel grid = new TableLayoutPanel
             {
-                Dock = DockStyle.Top,
-                Height = 136,
+                Dock = DockStyle.Fill,
                 ColumnCount = 2,
                 RowCount = 2,
-                Padding = new Padding(10, 8, 10, 4),
-                BackColor = Color.FromArgb(15, 23, 42)
+                Padding = new Padding(2)
             };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
@@ -116,59 +135,44 @@ namespace NexusManager
 
             services.Add(CreateServiceCard("telegram_bot.py", "Telegram Bot (@NexusEsGayBot)", pyExe, "-u telegram_bot.py", true));
             services.Add(CreateServiceCard("main.py", "FastAPI Server (127.0.0.1:8000)", pyExe, "-u -m uvicorn main:app --host 127.0.0.1 --port 8000", true));
-            services.Add(CreateServiceCard("tokens.py", "SIASE HTMLToken & SSO Auth", "", "", false));
-            services.Add(CreateServiceCard("requests_utils.py", "Nexus WebApi Client & Parser", "", "", false));
+            services.Add(CreateServiceCard("tokens.py", "SIASE HTMLToken and SSO Auth", "", "", false));
+            services.Add(CreateServiceCard("requests_utils.py", "Nexus WebApi Client and Parser", "", "", false));
 
             grid.Controls.Add(services[0].Card, 0, 0);
             grid.Controls.Add(services[1].Card, 1, 0);
             grid.Controls.Add(services[2].Card, 0, 1);
             grid.Controls.Add(services[3].Card, 1, 1);
+            servicesGroup.Controls.Add(grid);
 
-            // Terminal Header Label
-            Panel termHeader = new Panel
+            // Terminal GroupBox
+            GroupBox terminalGroup = new GroupBox
             {
-                Dock = DockStyle.Top,
-                Height = 26,
-                BackColor = Color.FromArgb(15, 23, 42),
-                Padding = new Padding(12, 4, 12, 0)
-            };
-            Label termTitle = new Label
-            {
-                Text = "📟 LIVE BOT I/O TERMINAL LOG (MESSAGES IN & OUT)",
-                Font = new Font("Consolas", 9f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(148, 163, 184),
-                AutoSize = true,
-                Location = new Point(12, 5)
-            };
-            termHeader.Controls.Add(termTitle);
-
-            // Terminal Log Box
-            Panel termContainer = new Panel
-            {
+                Text = "Console Activity Log (Messages In and Out)",
                 Dock = DockStyle.Fill,
-                Padding = new Padding(12, 2, 12, 12),
-                BackColor = Color.FromArgb(15, 23, 42)
+                Padding = new Padding(8, 8, 8, 8),
+                BackColor = SystemColors.Control
             };
 
             terminalBox = new RichTextBox
             {
                 Dock = DockStyle.Fill,
-                BackColor = Color.FromArgb(9, 13, 22),
-                ForeColor = Color.FromArgb(203, 213, 225),
-                Font = new Font("Consolas", 9.5f, FontStyle.Regular),
+                BackColor = Color.Black,
+                ForeColor = Color.Gainsboro,
+                Font = new Font("Consolas", 9f, FontStyle.Regular),
                 ReadOnly = true,
-                BorderStyle = BorderStyle.None,
+                BorderStyle = BorderStyle.Fixed3D,
                 ScrollBars = RichTextBoxScrollBars.Vertical,
                 WordWrap = true,
                 DetectUrls = false
             };
 
-            termContainer.Controls.Add(terminalBox);
+            terminalGroup.Controls.Add(terminalBox);
 
-            this.Controls.Add(termContainer);
-            this.Controls.Add(termHeader);
-            this.Controls.Add(grid);
+            // Add controls (Dock ordering: Fill must be added before Top to layout properly in WinForms)
+            this.Controls.Add(terminalGroup);
+            this.Controls.Add(servicesGroup);
             this.Controls.Add(header);
+            this.Controls.Add(statusStrip);
         }
 
         private PyService CreateServiceCard(string name, string role, string exe, string args, bool isProc)
@@ -176,39 +180,40 @@ namespace NexusManager
             Panel card = new Panel
             {
                 Dock = DockStyle.Fill,
-                BackColor = Color.FromArgb(30, 41, 59),
-                Margin = new Padding(4),
-                Padding = new Padding(8, 6, 8, 6)
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = SystemColors.Window,
+                Margin = new Padding(3),
+                Padding = new Padding(6, 4, 6, 4)
             };
 
-            Label dot = new Label
+            Label badge = new Label
             {
-                Text = "●",
-                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(74, 222, 128),
+                Text = isProc ? "[ STARTING ]" : "[ MODULE ]",
+                Font = new Font("Tahoma", 7.5f, FontStyle.Bold),
+                ForeColor = isProc ? Color.DarkGoldenrod : Color.DarkBlue,
                 AutoSize = true,
-                Location = new Point(8, 6)
+                Location = new Point(6, 6)
             };
 
             Label nameLbl = new Label
             {
-                Text = name + "  —  " + role,
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(241, 245, 249),
+                Text = name + " : " + role,
+                Font = new Font("Tahoma", 8.25f, FontStyle.Bold),
+                ForeColor = Color.Black,
                 AutoSize = true,
-                Location = new Point(28, 7)
+                Location = new Point(88, 6)
             };
 
             Label infoLbl = new Label
             {
-                Text = isProc ? "Starting protected daemon..." : "Loaded by active daemons • Ready",
+                Text = isProc ? "Starting process..." : "Active module (imported by active instances)",
                 Font = new Font("Consolas", 8.25f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(148, 163, 184),
+                ForeColor = Color.FromArgb(70, 70, 70),
                 AutoSize = true,
-                Location = new Point(30, 28)
+                Location = new Point(8, 25)
             };
 
-            card.Controls.Add(dot);
+            card.Controls.Add(badge);
             card.Controls.Add(nameLbl);
             card.Controls.Add(infoLbl);
 
@@ -220,7 +225,7 @@ namespace NexusManager
                 Arguments = args,
                 IsProcess = isProc,
                 Card = card,
-                DotLabel = dot,
+                BadgeLabel = badge,
                 NameLabel = nameLbl,
                 InfoLabel = infoLbl,
                 StartTime = DateTime.Now
@@ -246,7 +251,7 @@ namespace NexusManager
         private void InitServices()
         {
             CleanupOrphanedPyProcesses();
-            AppendLog("[GUARDIAN] Initializing protected Python instances outside sandbox...", Color.FromArgb(56, 189, 248));
+            AppendLog("[GUARDIAN] Initializing protected Python instances...", Color.LightSkyBlue);
             foreach (var svc in services)
             {
                 if (svc.IsProcess)
@@ -298,16 +303,16 @@ namespace NexusManager
                 if (isRespawn)
                 {
                     svc.RespawnCount++;
-                    AppendLog(string.Format("[WATCHDOG] Respawned {0} (PID: {1}, Respawns: {2})", svc.Name, p.Id, svc.RespawnCount), Color.FromArgb(250, 204, 21));
+                    AppendLog(string.Format("[WATCHDOG] Respawned {0} (PID: {1}, Respawns: {2})", svc.Name, p.Id, svc.RespawnCount), Color.Khaki);
                 }
                 else
                 {
-                    AppendLog(string.Format("[SYSTEM] Started {0} (PID: {1})", svc.Name, p.Id), Color.FromArgb(74, 222, 128));
+                    AppendLog(string.Format("[SYSTEM] Started {0} (PID: {1})", svc.Name, p.Id), Color.LightGreen);
                 }
             }
             catch (Exception ex)
             {
-                AppendLog(string.Format("[ERROR] Failed to start {0}: {1}", svc.Name, ex.Message), Color.FromArgb(248, 113, 113));
+                AppendLog(string.Format("[ERROR] Failed to start {0}: {1}", svc.Name, ex.Message), Color.Salmon);
             }
         }
 
@@ -342,14 +347,16 @@ namespace NexusManager
 
                 EnsureGuardianProcess();
 
+                int activeCount = 0;
                 foreach (var svc in services)
                 {
                     if (!svc.IsProcess)
                     {
                         bool botUp = services[0].Proc != null && !services[0].Proc.HasExited;
                         bool apiUp = services[1].Proc != null && !services[1].Proc.HasExited;
-                        svc.DotLabel.ForeColor = (botUp && apiUp) ? Color.FromArgb(56, 189, 248) : Color.FromArgb(250, 204, 21);
-                        svc.InfoLabel.Text = string.Format("ACTIVE MODULE • Imported by PID {0} & {1}",
+                        svc.BadgeLabel.Text = "[ MODULE ]";
+                        svc.BadgeLabel.ForeColor = (botUp && apiUp) ? Color.DarkBlue : Color.DarkOrange;
+                        svc.InfoLabel.Text = string.Format("Active module : Imported by PID {0} and {1}",
                             botUp ? services[0].Proc.Id.ToString() : "-",
                             apiUp ? services[1].Proc.Id.ToString() : "-");
                         continue;
@@ -357,17 +364,25 @@ namespace NexusManager
 
                     if (svc.Proc == null || svc.Proc.HasExited)
                     {
-                        svc.DotLabel.ForeColor = Color.FromArgb(248, 113, 113);
-                        svc.InfoLabel.Text = "PROCESS TERMINATED — RESPAWNING NOW...";
+                        svc.BadgeLabel.Text = "[ STOPPED ]";
+                        svc.BadgeLabel.ForeColor = Color.DarkRed;
+                        svc.InfoLabel.Text = "Process terminated : Respawning immediately...";
                         StartPyProcess(svc, true);
                     }
                     else
                     {
+                        activeCount++;
                         TimeSpan up = DateTime.Now - svc.StartTime;
-                        svc.DotLabel.ForeColor = Color.FromArgb(74, 222, 128);
-                        svc.InfoLabel.Text = string.Format("RUNNING • PID: {0} • Uptime: {1:D2}:{2:D2}:{3:D2} • Respawns: {4}",
+                        svc.BadgeLabel.Text = "[ RUNNING ]";
+                        svc.BadgeLabel.ForeColor = Color.DarkGreen;
+                        svc.InfoLabel.Text = string.Format("PID: {0} | Uptime: {1:D2}:{2:D2}:{3:D2} | Respawns: {4}",
                             svc.Proc.Id, (int)up.TotalHours, up.Minutes, up.Seconds, svc.RespawnCount);
                     }
+                }
+
+                if (statusInstancesLabel != null)
+                {
+                    statusInstancesLabel.Text = string.Format("Instances: {0} active, {1} modules", activeCount, services.Count - activeCount);
                 }
             };
             watchdogTimer.Start();
@@ -377,23 +392,22 @@ namespace NexusManager
         {
             if (svc.Name == "main.py")
             {
-                // Only show interesting FastAPI requests or startup lines to keep bot log clean
                 if (line.Contains("POST /") || line.Contains("GET /") || line.Contains("Uvicorn running"))
                 {
-                    AppendLog("[API] " + line, Color.FromArgb(148, 163, 184));
+                    AppendLog("[API] " + line, Color.FromArgb(160, 160, 160));
                 }
                 return;
             }
 
-            Color c = Color.FromArgb(203, 213, 225);
+            Color c = Color.Gainsboro;
             if (line.Contains("[USER -> IN"))
-                c = Color.FromArgb(56, 189, 248); // Cyan for incoming user messages
+                c = Color.LightSkyBlue;
             else if (line.Contains("[BOT -> OUT]"))
-                c = Color.FromArgb(74, 222, 128); // Green for outgoing bot replies
+                c = Color.LightGreen;
             else if (line.Contains("[SYS]"))
-                c = Color.FromArgb(250, 204, 21); // Amber for system events
+                c = Color.Khaki;
             else if (isErr || line.Contains("Error") || line.Contains("error"))
-                c = Color.FromArgb(248, 113, 113);
+                c = Color.Salmon;
 
             AppendLog(line, c);
         }
@@ -422,7 +436,6 @@ namespace NexusManager
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
-            // Secret emergency owner shutdown hotkey: Ctrl + Shift + Alt + K
             if (e.Control && e.Shift && e.Alt && e.KeyCode == Keys.K)
             {
                 allowExit = true;
@@ -454,7 +467,7 @@ namespace NexusManager
             {
                 e.Cancel = true;
                 this.WindowState = FormWindowState.Normal;
-                AppendLog("[GUARDIAN] Window close blocked! Instances are protected.", Color.FromArgb(250, 204, 21));
+                AppendLog("[GUARDIAN] Window close blocked. Instances are protected.", Color.Khaki);
                 return;
             }
             base.OnFormClosing(e);
@@ -468,7 +481,6 @@ namespace NexusManager
         {
             string workDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
 
-            // Guardian mode: watches the main UI process and immediately relaunches it if killed in Task Manager
             if (args.Length >= 2 && args[0] == "--guardian")
             {
                 int targetPid;
@@ -481,7 +493,6 @@ namespace NexusManager
                     }
                     catch { }
 
-                    // Respawn main UI manager immediately
                     try
                     {
                         Process.Start(new ProcessStartInfo
